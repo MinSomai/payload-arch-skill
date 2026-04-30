@@ -37,7 +37,7 @@ new PayloadCMS project and let this skill handle the rest.
 
 Register this repo as a Claude Code plugin marketplace:
 
-/plugin marketplace add MinSomai/payload-arch-skill
+`/plugin marketplace add MinSomai/payload-arch-skill`
 
 Then install the skill:
 
@@ -54,13 +54,13 @@ jobs, SWR, components, or data fetching.
 
 You can also invoke it explicitly:
 
-/payload-arch where should this logic live?
+`/payload-arch where should this logic live?`
 
 ## Works best alongside
 
 Install the official PayloadCMS skill for deep framework reference (collections, hooks, queries):
 
-/plugin marketplace add payloadcms/skills
+`/plugin marketplace add payloadcms/skills`
 
 The two skills are complementary — `payload` covers what the framework can do, `payload-arch`
 covers how to structure your project on top of it.

@@ -61,10 +61,57 @@ const someEndpoints: Endpoint[] = [
 export default someEndpoints
 ```
 
+### Registration — where routes are wired up
+
+Routes are **always registered inside a collection's `endpoints` array**, never as global endpoints
+in `payload.config.ts`. The URL becomes `/api/<collection-slug>/<path>`.
+
+**Simple collection** — spread the routes file directly in the collection config:
+
+```ts
+// src/collections/Courses/index.ts
+import courseEndpoints from '@/routes/course.routes'
+
+export const Courses: CollectionConfig = {
+  slug: 'courses',
+  // ...
+  endpoints: [...courseEndpoints],
+}
+// → available at: /api/courses/some-path
+```
+
+**Collection with many endpoints** — use an aggregation file that combines imported routes with any
+inline handlers, then spread that in the collection:
+
+```ts
+// src/collections/Evaluations/endpoints/index.ts
+import evaluationEndpoints from '@/routes/evaluation.routes'
+import { Endpoint } from 'payload'
+
+const endpoints: Endpoint[] = [
+  ...evaluationEndpoints,
+  // additional inline entries only if they have no business logic
+]
+
+export default endpoints
+
+// src/collections/Evaluations/index.ts
+import endpoints from './endpoints'
+export const Evaluations: CollectionConfig = {
+  slug: 'evaluations',
+  endpoints,
+}
+```
+
+**Choosing which collection:** pick the collection that is semantically the subject of the endpoint.
+Webhook integration endpoints live on the `webhooks` collection → `/api/webhooks/integrations/...`.
+
 Rules:
 - Export a single `Endpoint[]` array as default.
 - Instantiate the controller once at module level and pass handlers by reference.
 - No `if` statements, no request parsing, no imports of services or stores.
+- Even inside `src/collections/<Domain>/endpoints/index.ts` — inline handlers must delegate to a
+  controller, never contain business logic directly.
 - File naming: `<domain>.routes.ts`.
 
 ---
@@ -643,6 +690,7 @@ const MyComp = ({ courseId }) => {
 | What you're writing | Where it goes |
 |---|---|
 | HTTP endpoint registration | `src/routes/<domain>.routes.ts` |
+| Endpoint aggregation (complex collections) | `src/collections/<Domain>/endpoints/index.ts` |
 | Request parsing + response formatting | `src/controllers/<domain>.controllers.ts` |
 | Business logic | `src/services/<domain>.service.ts` |
 | Third-party API wrapper | `src/services/<vendor>/<vendor>.service.ts` |
