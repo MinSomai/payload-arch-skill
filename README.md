@@ -60,7 +60,7 @@ You can also invoke it explicitly:
 
 Install the official PayloadCMS skill for deep framework reference (collections, hooks, queries):
 
-`/plugin marketplace add payloadcms/skills`
+`npx skills add payloadcms/skills`
 
 The two skills are complementary — `payload` covers what the framework can do, `payload-arch`
 covers how to structure your project on top of it.
