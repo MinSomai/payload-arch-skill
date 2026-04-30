@@ -1,0 +1,21 @@
+{
+  "name": "payload-arch-skill",
+  "owner": {
+    "name": "Min Somai"
+  },
+  "metadata": {
+    "description": "Layered architecture skill for PayloadCMS projects",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "payload-arch",
+      "description": "Enforces route → controller → service → store architecture for PayloadCMS projects with SWR frontend patterns",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/payload-arch"
+      ]
+    }
+  ]
+}
