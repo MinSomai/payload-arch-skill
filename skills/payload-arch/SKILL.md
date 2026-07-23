@@ -9,8 +9,11 @@ description: >
   or polling for live status. The stack is PayloadCMS backend with TypeScript, strict inward-only
   dependency flow, SWR + payloadClientSDK on the frontend, constants in src/const, env in
   src/config/config.ts, pure helpers in src/lib, and jobs split into task definitions and workflows.
+  Also use it for custom PayloadCMS admin panel components (custom field inputs, UI fields, cells,
+  row labels) that use Payload UI hooks like useField, useForm, useDocumentInfo, and useFormInitializing.
   If the user mentions routes, controllers, services, stores, jobs, constants, config, lib, SWR,
-  components, or data fetching in the context of a PayloadCMS project, apply this skill.
+  components, custom admin components, field components, or data fetching in the context of a
+  PayloadCMS project, apply this skill.
 ---
 
 # Payload Architecture Guide
@@ -702,6 +705,112 @@ const MyComp = ({ courseId }) => {
 
 ---
 
+## Custom Admin Components
+
+PayloadCMS lets you inject React components into the admin panel — custom field inputs, UI fields,
+row labels, cells, view overrides, etc. These are **not** the dashboard components covered above;
+they render *inside* the Payload admin UI and talk to the form through Payload's own hooks, not SWR.
+
+### Registration
+
+Components are referenced from a collection/field config by **import path string** (Payload builds a
+component map at build time — you never import the component into the config directly):
+
+```ts
+// src/collections/Evaluations/index.ts
+{
+  name: 'prefillData',
+  type: 'ui',                       // a UI field renders a component but stores nothing
+  admin: {
+    components: {
+      Field: '@/components/admin/PrefillData',   // path string, not an import
+    },
+  },
+}
+```
+
+### Client component pattern
+
+Any component that uses Payload UI hooks or React state must be a client component. Type it with the
+matching Payload type (`UIFieldClientComponent`, `TextFieldClientComponent`, `FieldClientComponent`,
+etc.) so the injected props are correct.
+
+```tsx
+'use client'
+
+import { useEffect, useRef } from 'react'
+import { useDocumentInfo, useField, useFormInitializing } from '@payloadcms/ui'
+import { useSearchParams } from 'next/navigation'
+import type { UIFieldClientComponent } from 'payload'
+
+const PrefillData: UIFieldClientComponent = () => {
+  const searchParams = useSearchParams()
+  const { isEditing } = useDocumentInfo()
+  const { setValue: setCourse } = useField({ path: 'course' })
+  const { value: nameValue, setValue: setName } = useField<string>({ path: 'name' })
+
+  const isFormInitializing = useFormInitializing()
+  const hasPrefilled = useRef(false)
+
+  useEffect(() => {
+    // ⛔ Bail until the form has finished initializing — see note below.
+    if (isEditing || isFormInitializing || hasPrefilled.current) return
+
+    const course = searchParams.get('course')
+    if (!course) return
+
+    hasPrefilled.current = true        // run-once guard
+    setCourse(course)                  // conditionally-shown fields: set in dependency order
+
+    // Default values set during initialization are now safe to read/modify.
+    if (nameValue && !nameValue.endsWith('__MANUAL')) {
+      setName(`${nameValue}__MANUAL`)
+    }
+  }, [isEditing, isFormInitializing, searchParams, setCourse, nameValue, setName])
+
+  return null   // side-effect-only UI fields render nothing
+}
+
+export default PrefillData
+```
+
+### Key hooks
+
+| Hook | Returns | Use for |
+|---|---|---|
+| `useField({ path })` | `{ value, setValue }` | read/write one field's value in the live form |
+| `useFormInitializing()` | `boolean` | **gate all form reads/writes until `false`** (see below) |
+| `useDocumentInfo()` | `{ isEditing, id, ... }` | distinguish create vs edit, get the doc id |
+| `useForm()` | form context (`fields`, `dispatchFields`, ...) | lower-level, multi-field operations |
+
+### `useFormInitializing()` — the critical one
+
+**Always gate field reads and writes on `useFormInitializing()`.** While the form is initializing,
+Payload is still applying `defaultValue`s and hydrating existing data. If you `setValue` during that
+window your write is **clobbered** by the initialization pass, and if you *read* a value you get a
+stale/empty one. Waiting until `isFormInitializing === false` guarantees:
+
+- default values (like the auto-generated `name`) are already present, so you can safely read and
+  amend them, and
+- your `setValue` calls survive instead of being overwritten.
+
+Pair it with a `useRef` run-once guard (`hasPrefilled`) so the effect fires exactly once after
+initialization, not on every dependency change.
+
+### Rules
+
+- **`'use client'`** on every component that uses these hooks — they are client-only.
+- **Register by path string**, never by importing the component into the config.
+- **Type with the Payload `*ClientComponent` / `*ServerComponent` type** for correct injected props.
+- **Gate every form read/write on `!isFormInitializing`** — the single most common source of
+  "my default disappeared" / "my value didn't stick" bugs.
+- **Use `useField`/`useForm` to touch form state** — never reach for SWR or `payloadClientSDK` to
+  read the record being edited; it's already in the form.
+- **Set conditionally-rendered fields in dependency order** (parent before child).
+- **File placement:** `src/components/admin/<Name>.tsx` (kept separate from dashboard components).
+
+---
+
 ## File Placement Cheat Sheet
 
 | What you're writing | Where it goes |
@@ -720,6 +829,7 @@ const MyComp = ({ courseId }) => {
 | Task handler function | `src/jobs/tasks/<domain>.task.ts` (or `src/runners/` for legacy) |
 | Domain-specific service utilities | `src/services/lib/<purpose>.lib.ts` |
 | Client-side data fetching | `useSWR` in the component file, key factory exported |
+| Custom admin panel component (field/UI/cell) | `src/components/admin/<Name>.tsx`, registered by path string |
 | Domain-specific TypeScript types | `src/types/<domain>.types.ts` + re-export in `src/types/index.ts` |
 | Domain-specific pure utilities | `src/utils/<domain>.utils.ts` + re-export in `src/utils/index.ts` |
 | Payload access control functions | `src/access/<name>.ts` |
@@ -749,6 +859,7 @@ const MyComp = ({ courseId }) => {
 - **`getPayload()` in a client component** — server-only, will break at runtime.
 - **`payloadClientSDK` in a server page** — client-only, use `getPayload()` in pages instead.
 - **Fetching the same data in both the page and via SWR** — pick one. Page → seed data for the primary entity. SWR → everything secondary and dynamic.
+- **Reading or writing form fields before `useFormInitializing()` is `false`** in a custom admin component — your `setValue` gets clobbered by initialization and reads return stale/empty values. Always gate on `!isFormInitializing` and use a `useRef` run-once guard.
 
 ---
 
