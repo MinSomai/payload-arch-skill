@@ -48,18 +48,34 @@ Routes register Payload custom endpoints. They contain zero logic.
 import SomeControllers from "@/controllers/some.controllers"
 import { Endpoint } from "payload"
 
-const someControllers = new SomeControllers()
+let controllers: SomeControllers | null = null
+const getControllers = () => (controllers ??= new SomeControllers())
 
 const someEndpoints: Endpoint[] = [
   {
     path: '/some/path',
     method: 'post',
-    handler: someControllers.handleSomething,
+    handler: (req) => getControllers().handleSomething(req),
   },
 ]
 
 export default someEndpoints
 ```
+
+**Instantiate controllers lazily — never at module top level.** A route file is pulled into the
+Payload config graph (`@payload-config`), which is itself imported by many entry points. If the
+controller is constructed eagerly (`const c = new SomeControllers()` at module scope), the *entire*
+service/store tree behind it is constructed the moment the config is evaluated. When any of those
+services participates in an import cycle back to the module currently being evaluated, you get a
+temporal-dead-zone crash at build/startup:
+
+```
+Cannot access 'X' before initialization
+```
+
+The lazy getter (`??=`) defers construction until the first request actually hits the handler — by
+then every module has finished initializing, so the cycle is harmless. Wrap each handler as
+`(req) => getControllers().handleX(req)` so the controller isn't touched until invocation.
 
 ### Registration — where routes are wired up
 
@@ -108,7 +124,8 @@ Webhook integration endpoints live on the `webhooks` collection → `/api/webhoo
 
 Rules:
 - Export a single `Endpoint[]` array as default.
-- Instantiate the controller once at module level and pass handlers by reference.
+- Instantiate the controller **lazily** via a `getControllers()` getter — never `new` it at module
+  top level (see the TDZ note above). Wrap handlers as `(req) => getControllers().handleX(req)`.
 - No `if` statements, no request parsing, no imports of services or stores.
 - Even inside `src/collections/<Domain>/endpoints/index.ts` — inline handlers must delegate to a
   controller, never contain business logic directly.
@@ -711,6 +728,10 @@ const MyComp = ({ courseId }) => {
 
 ## Common Mistakes to Avoid
 
+- **Instantiating a controller at module top level in a route file** — `const c = new SomeControllers()`
+  eagerly builds the whole service/store tree when the Payload config is evaluated, and triggers a
+  temporal-dead-zone crash (`Cannot access 'X' before initialization`) whenever a service in that tree
+  imports back into a module still initializing. Use the lazy `getControllers()` getter instead.
 - **Reading `process.env` outside `config.ts`** — always go through `config()`.
 - **Putting logic in a controller** — if you write an `if` that isn't about the HTTP request shape,
   it belongs in a service.
