@@ -9,6 +9,9 @@ description: >
   or polling for live status. The stack is PayloadCMS backend with TypeScript, strict inward-only
   dependency flow, SWR + payloadClientSDK on the frontend, constants in src/const, env in
   src/config/config.ts, pure helpers in src/lib, and jobs split into task definitions and workflows.
+  The Payload instance is dependency-injected through constructors (stores/services take a Payload;
+  controllers build them per request from req.payload); only a memoized payload-client helper imports
+  @payload-config, via a dynamic import, to keep the config off the startup module graph.
   Also use it for custom PayloadCMS admin panel components (custom field inputs, UI fields, cells,
   row labels) that use Payload UI hooks like useField, useForm, useDocumentInfo, and useFormInitializing.
   If the user mentions routes, controllers, services, stores, jobs, constants, config, lib, SWR,
@@ -40,6 +43,68 @@ Route → Controller → Service → Store
 **Dependency rule:** each layer may only call inward. A controller may call services and (through them)
 stores, but never the reverse. A store must never import a service. A service must never import a
 controller.
+
+---
+
+## Payload access: dependency injection
+
+The `Payload` instance flows **inward through constructors** — it is never imported per layer. Nothing
+below `src/app/**` may statically import `@payload-config`. One memoized helper owns that edge with a
+**dynamic** `import()`; anywhere a request exists, use `req.payload` instead.
+
+**Why (keep this rationale — it's the whole justification):** `payload.config.ts` imports every
+collection → collections mount route `endpoints` → routes import controllers → services → stores →
+`@payload-config`. That closes a cycle, so a single *static* config import anywhere drags the entire
+backend into whatever module graph touches it. Non-Next consumers (an agent server, a CLI, a script)
+then have to compile the whole backend, and a stray extensionless import in an unrelated controller can
+stop them from booting. `getPayload()` returns a **process-wide cached singleton**, so `req.payload`
+and the helper's result are the *same object* — passing the instance around is free and removes a
+bootstrap call from every store method.
+
+The helper — the **only** module allowed to name `@payload-config` outside `src/app/**`:
+
+```ts
+// src/lib/payload-client.ts
+import { getPayload, type Payload, type SanitizedConfig } from 'payload'
+
+let configLoad: Promise<SanitizedConfig> | undefined
+let clientLoad: Promise<Payload> | undefined
+
+/** For the rare caller needing the config itself (e.g. email transport settings). */
+export function loadPayloadConfig(): Promise<SanitizedConfig> {
+  configLoad ??= import('@payload-config').then((mod) => mod.default) // MUST stay dynamic
+  return configLoad
+}
+
+/** Drop-in replacement for `getPayload({ config: configPromise })`. */
+export function getPayloadClient(): Promise<Payload> {
+  clientLoad ??= loadPayloadConfig().then((config) => getPayload({ config }))
+  return clientLoad
+}
+```
+
+**Who gets `payload` from where:**
+
+| Caller | Source |
+|---|---|
+| Controller handler | `req.payload` |
+| Collection hook | `req.payload` (or `args.req.payload` in `afterOperation`) |
+| Job task / workflow handler | `req.payload` (handlers receive `{ input, req }`) |
+| Agent tool / script / cron / test bootstrap | `await getPayloadClient()` |
+| Unit test with mocked collaborators | `{} as Payload` stub |
+
+Rules:
+- The `import('@payload-config')` **must stay dynamic** — making it static reintroduces the cycle and
+  undoes the whole win.
+- Both functions memoize with `??=` on a **module-scoped promise**, not a boolean flag.
+- Call `getPayloadClient()` **only** where no request exists (agent tools, scripts, cron, tests).
+  Anywhere with a request, use `req.payload`.
+- `src/app/**` (pages, route handlers) and per-request Next config — e.g. a `next-intl`
+  `getRequestConfig` that calls `payload.auth({ headers })` — keep importing `@payload-config`
+  directly. Next compiles them per request regardless.
+- **Never open a persistent DB/socket connection at module scope** in anything `payload.config.ts`
+  transitively imports — it keeps the event loop alive and short-lived CLIs (`generate:types`,
+  `generate:importmap`) hang forever. Open connections lazily on first use.
 
 ---
 
@@ -141,26 +206,32 @@ Rules:
 Controllers parse the HTTP request, delegate entirely to service(s), and format the HTTP response.
 Business logic does not belong here.
 
+A controller **cannot** construct services in its own constructor — there is no request (and no
+`req.payload`) at that point. Build dependencies **per request** via a private `deps(req)` factory and
+destructure at the top of each handler.
+
 ```ts
 import SomeService from "@/services/some.service"
-import { PayloadHandler, PayloadRequest } from "payload"
+import { APIError, PayloadHandler, PayloadRequest } from "payload"
 
 class SomeControllers {
-  someService: SomeService
-
-  constructor() {
-    this.someService = new SomeService()
+  // Services need a Payload instance → build them per request from req.payload.
+  private deps(req: PayloadRequest) {
+    return { someService: new SomeService(req.payload) }
   }
 
   handleSomething: PayloadHandler = async (req: PayloadRequest) => {
+    const { someService } = this.deps(req)
+    const payload = req.payload // for payload.logger etc.
+
     try {
       if (!req.json) return Response.json({ message: 'no payload' }, { status: 400 })
       const body = await req.json()
 
-      const result = await this.someService.doSomething(body)
+      const result = await someService.doSomething(body)
       return Response.json({ message: 'Success', data: result }, { status: 200 })
     } catch (e) {
-      console.log({ e })
+      payload.logger.error({ e }, 'handleSomething')
       return Response.json({ error: 'Something went wrong' }, { status: 400 })
     }
   }
@@ -172,7 +243,16 @@ export default SomeControllers
 Rules:
 - One class per file, exported as default.
 - Handlers typed as `PayloadHandler = async (req: PayloadRequest) => Response`.
-- Constructor instantiates all required services.
+- **Build services per request via a private `deps(req)` factory**, not in the constructor.
+  Construction is cheap (object allocation only — the Payload instance is a cached singleton).
+- **Do not cache `deps()` results on the instance** — that pins one request's data to a shared object.
+- `const payload = req.payload` replaces any `await getPayload(...)` inside a handler (in practice
+  mostly `payload.logger`).
+- A controller whose services need **no** payload (a pure HTTP-client wrapper, or a service that takes
+  payload per call) keeps a plain `constructor()` and normal fields — don't convert it to `deps(req)`
+  for uniformity; it buys nothing.
+- Handlers not typed `PayloadHandler` (e.g. `login = async (req: PayloadRequest) => {}`) follow the
+  same pattern; they also receive `req`.
 - May call multiple services, but never other controllers and never stores directly.
 - Always wrap in try/catch and return `Response.json(...)` — never throw out of a handler.
 - File naming: `<domain>.controllers.ts`.
@@ -184,21 +264,28 @@ Rules:
 Services own all business logic. This is the most important layer — if you're unsure where code goes,
 it's almost certainly a service.
 
+A service takes a `Payload` instance as its **first** constructor parameter and passes it inward to the
+stores and sub-services it builds.
+
 ```ts
+import type { Payload } from "payload"
 import SomeStore from "@/store/some.store"
+import GroupService from "@/services/group.service"
 import CacheService from "@/services/cache.service"
 
 class SomeService {
   someStore: SomeStore
+  groupService: GroupService
   cacheService: CacheService
 
-  constructor() {
-    this.someStore = new SomeStore()
+  constructor(private readonly payload: Payload) {
+    this.someStore = new SomeStore(payload)       // pass the instance inward
+    this.groupService = new GroupService(payload) // sub-services too
     this.cacheService = CacheService.getInstance()
   }
 
   doSomething = async (input: SomeInput) => {
-    // business logic here
+    // business logic here — use this.payload directly if the service needs it
     const cached = await this.cacheService.get<SomeResult>(cacheKey)
     if (cached) return cached
 
@@ -244,6 +331,22 @@ import from `src/lib` but not from other services or stores. Example:
 
 Rules:
 - Class-based, exported as default.
+- **`payload` is the first constructor parameter**; existing options move after it
+  (`constructor(payload: Payload, { attachmentPersister }: Deps)`). Pass it down when building stores
+  and sub-services; use `this.payload` when the service needs the instance directly.
+- **Never build a payload-consuming dependency in a class-field initializer.** With `target: ES2022`,
+  field initializers run *before* parameter properties are assigned, so `this.payload` is still
+  `undefined` there (TS flags it as `TS2729`). Declare the field, build it in the constructor body:
+  ```ts
+  class StudentAuthService {
+    private studentAuthStore = new StudentAuthStore()  // no payload → field initializer is fine
+    private emailService: EmailService                 // needs payload → declare only
+    constructor(private readonly payload: Payload) {
+      this.emailService = new EmailService(payload)     // ...and build it here
+    }
+  }
+  ```
+- Cross-cutting singletons/statics are unchanged: `CacheService.getInstance()`, `AlertServices`.
 - May call other services and stores — both are fine.
 - Must never be called by a store.
 - Must never import a controller.
@@ -253,22 +356,23 @@ Rules:
 
 ## Layer 4: Stores (`src/store/*.store.ts`)
 
-Stores are the only place that talks to the Payload database via `getPayload()`. They contain pure
-CRUD — no business logic, no external HTTP calls.
+Stores are the only place that talks to the Payload database (via the injected `Payload` instance's
+local API). They contain pure CRUD — no business logic, no external HTTP calls.
+
+The `Payload` instance is injected via the constructor — a store never bootstraps its own.
 
 ```ts
-import { getPayload } from 'payload'
-import configPromise from '@payload-config'
+import type { Payload } from 'payload'
 
 class SomeStore {
+  constructor(private readonly payload: Payload) {}
+
   async findById(id: string) {
-    const payload = await getPayload({ config: configPromise })
-    return payload.findByID({ collection: 'some-collection', id, depth: 0 })
+    return this.payload.findByID({ collection: 'some-collection', id, depth: 0 })
   }
 
   async create(data: CreateSomeInput) {
-    const payload = await getPayload({ config: configPromise })
-    return payload.create({ collection: 'some-collection', data })
+    return this.payload.create({ collection: 'some-collection', data })
   }
 }
 
@@ -276,12 +380,82 @@ export default SomeStore
 ```
 
 Rules:
-- Call `getPayload({ config: configPromise })` at the top of every method.
-- `depth: 0` by default unless relationships must be populated — be explicit.
+- `constructor(private readonly payload: Payload) {}` — the injected instance, always the first
+  parameter. Use `this.payload` directly; never call `getPayload()` or import `@payload-config`.
+- Stores import **nothing** but types and `@/payload-types`. Delete any `initPayload()` /
+  `getPayload()` indirection.
+- Still pure CRUD. `depth: 0` by default unless relationships must be populated — be explicit.
 - No `if` blocks for business decisions. If there's a branch based on business rules, it belongs in
   a service that calls this store.
 - Must never import a service or controller.
 - File naming: `<domain>.store.ts`.
+
+### Transactions and enforced access — pass typed values, never raw `req`
+
+Stores keep the constructor-injected `payload` and take everything else as **typed arguments**. Never
+thread a raw `PayloadRequest` into a store or service — it couples the inner layers to the HTTP
+lifecycle and is painful to unit-test. The two things people reach for `req` to carry both reduce to
+plain values:
+
+**Transactions — a self-generated `transactionID`.** The service that owns the all-or-nothing boundary
+begins the transaction with its injected `payload` and threads the id (a `string | number`) to each
+store method; the store wraps it as `req: { transactionID }` internally. No incoming request involved.
+
+```ts
+// store — accepts a typed transactionID, builds the minimal req itself
+class CourseStore {
+  constructor(private readonly payload: Payload) {}
+
+  create = (data: CreateCourse, transactionID?: string | number) =>
+    this.payload.create({
+      collection: 'courses',
+      data,
+      req: transactionID ? { transactionID } : undefined,
+    })
+}
+
+// service — owns the transaction boundary via its injected payload
+class EnrollmentService {
+  courseStore: CourseStore
+  groupStore: GroupStore
+  constructor(private readonly payload: Payload) {
+    this.courseStore = new CourseStore(this.payload)
+    this.groupStore = new GroupStore(this.payload)
+  }
+
+  enroll = async (input: EnrollInput) => {
+    const transactionID = await this.payload.db.beginTransaction()
+    try {
+      await this.courseStore.create(input.course, transactionID ?? undefined)
+      await this.groupStore.create(input.group, transactionID ?? undefined)
+      if (transactionID) await this.payload.db.commitTransaction(transactionID)
+    } catch (err) {
+      if (transactionID) await this.payload.db.rollbackTransaction(transactionID)
+      throw err
+    }
+  }
+}
+```
+
+`beginTransaction()` returns `null` on databases without transaction support — the `transactionID ??
+undefined` guard means those calls just run non-transactionally.
+
+**Enforced access — a typed `user`.** Payload's local API takes a top-level `user` option, so a store
+that must evaluate access control passes the user, not a req. The controller extracts `req.user` and
+hands it in typed:
+
+```ts
+getCoursesForUser = (user: User) =>
+  this.payload.find({ collection: 'courses', overrideAccess: false, user })
+```
+
+Most backends instead enforce access at the route/controller layer (`if (!req.user) throw`) and let
+stores run as admin (`overrideAccess: true`, the default) — if that's your convention, stores never
+take `user` either.
+
+**The one escape hatch:** `overrideAccess: false` with a top-level `user` runs access with *only* the
+user — no `req.headers`, `req.locale`, or `req.i18n`. If an access rule reads any of those, that single
+call needs the real `req`. That case aside, keep raw `req` out of the store and service layers entirely.
 
 ---
 
@@ -407,6 +581,9 @@ Rules:
 - Functions only — no classes needed.
 - Shared across all layers; any layer may import from `src/lib`.
 - File naming: `<purpose>.ts` or `<domain>.<purpose>.ts`.
+- **One sanctioned exception:** `src/lib/payload-client.ts` (see *Payload access*) is the single
+  module that loads `@payload-config` and calls `getPayload()`. It lives here because it's the shared
+  bootstrap edge, not because it's pure.
 
 ---
 
@@ -439,7 +616,63 @@ const startEvaluationJob = {
 export { startEvaluationJob }
 ```
 
-Task handlers may import services to do their work — jobs are consumers of the service layer.
+Task handlers receive `{ input, req }` and build services from `req.payload` **inside the handler** —
+one instance per invocation, never at module scope (there is no request at module load):
+
+```ts
+export const handleSyncMoodleCourse: TaskHandler<'syncMoodleCourse'> = async ({ input, req }) => {
+  const moodleSyncService = new MoodleSyncService(req.payload)
+  // ...
+}
+```
+
+Jobs are consumers of the service layer.
+
+---
+
+## Module-graph & Performance Hygiene
+
+Dev-server RAM blowups and slow compiles in this stack are usually one of a few known causes. Work
+**empirically** — measure a route's first-compile time and peak RSS before and after a change; never
+claim an improvement you haven't measured. A fast `Ready in ~300ms` is meaningless on its own because
+routes compile lazily on first request. Measure with:
+
+```bash
+# first-compile time per route (do it for /, the login page, and heavy /api routes)
+curl -s -o /dev/null -m 300 -w "%{http_code} %{time_total}s\n" http://localhost:3000/<route>
+# peak RSS while compiling
+ps -eo pid,rss,command | grep "[n]ext-server" | awk '{s+=$2} END {printf "%.2f GB\n", s/1024/1024}'
+```
+
+Ordered by measured impact:
+
+- **Watch an exact-pinned `next`.** An exact pin (`"next": "16.2.3"`, no caret) makes `pnpm update`
+  silently skip all patch releases. Turbopack patch releases fix graph-corruption panics that cause
+  runaway memory (20+ GB) and massive slowdowns. Grep the dev log for `panicked at turbopack` — if
+  present, bump `next` + `eslint-config-next` to the latest patch of the same minor first, and
+  re-measure before anything else.
+- **Keep `@payload-config` off the startup graph** (see *Payload access* above — the config cycle is
+  the architectural cause). Verify with `npx madge --circular --extensions ts,tsx src/` and
+  `grep -rln "@payload-config\|payload.config" src | grep -v "^src/app/"` — the only non-`src/app/**`
+  hit should be `payload-client.ts`. Report reachable-file and cycle counts before/after so the win is
+  judged, not assumed.
+- **`serverExternalPackages`** in `next.config.ts` for any native/heavy dep that resolves
+  platform-specific binaries via a `require()` switch (`sharp`, `canvas`, `duckdb`, `libsql`,
+  `better-sqlite3`, `officeparser`, …). Otherwise the bundler tries to resolve every platform branch
+  and fails with `Can't resolve @foo/darwin-x64/foo.node`.
+- **No persistent connections at module scope** in anything the config transitively imports (same rule
+  as stores/services) — open them lazily on first use, or short-lived CLIs hang forever.
+- **No cwd-relative paths** (`file:./local.db`) for anything shared across processes — `next dev` and
+  other CLIs have different cwds and you silently get two files. Resolve an absolute path from a
+  repo-root marker.
+- **Duplicate package versions** fragment module identity and break `instanceof` across package
+  boundaries. Check `ls node_modules/.pnpm | grep "^<pkg>@"`; `pnpm why` can under-report peer variants.
+- **Use the project's own scripts** (`pnpm run build` / `pnpm run dev`) — they often set
+  `NODE_OPTIONS=--max-old-space-size`; a bare `npx next build` bypasses it and produces a fake OOM
+  (exit 137) that looks like a regression but isn't.
+
+After any change: `npx tsc --noEmit` clean, the test suite passes, `pnpm run build` succeeds, and heavy
+routes serve without panics. If a change produced no measurable improvement, say so and revert it.
 
 ---
 
@@ -821,6 +1054,7 @@ initialization, not on every dependency change.
 | Business logic | `src/services/<domain>.service.ts` |
 | Third-party API wrapper | `src/services/<vendor>/<vendor>.service.ts` |
 | Database queries (Payload CRUD) | `src/store/<domain>.store.ts` |
+| The one dynamic `@payload-config` loader | `src/lib/payload-client.ts` (memoized, dynamic import) |
 | Reusable pure helpers | `src/lib/<purpose>.ts` |
 | App constants / magic strings | `src/const/<domain>.const.ts` + re-export in `src/const/index.ts` |
 | Environment variables | `src/config/config.ts` |
@@ -845,9 +1079,17 @@ initialization, not on every dependency change.
 - **Reading `process.env` outside `config.ts`** — always go through `config()`.
 - **Putting logic in a controller** — if you write an `if` that isn't about the HTTP request shape,
   it belongs in a service.
-- **Calling `getPayload()` in a service** — that's what stores are for. Create a store and call it
-  from the service. (Exception: services that are tightly coupled to Payload internals like
-  `AlertServices` may call `getPayload()` directly for logging, but prefer stores for data access.)
+- **Calling `getPayload()` / importing `@payload-config` in a store, service, or controller** — the
+  `Payload` instance is injected via the constructor (from `req.payload`, or `getPayloadClient()` at
+  non-request entrypoints). Data access still goes through a store, not `getPayload()` in a service.
+- **Static `import '@payload-config'` anywhere below `src/app/**` except `payload-client.ts`** —
+  reintroduces the config cycle and drags the whole backend into every module graph. Use
+  `getPayloadClient()` (dynamic import) or `req.payload`.
+- **Building a payload-consuming dependency in a class-field initializer** — with `target: ES2022`,
+  field initializers run before parameter properties, so `this.payload` is `undefined` (`TS2729`).
+  Build it in the constructor body.
+- **Caching `deps(req)` on the controller instance** — leaks one request's context into a shared
+  object; rebuild it per handler.
 - **Importing a service from a store** — inward-only rule violation.
 - **Hardcoding strings that are used in multiple places** — put them in `src/const/`.
 - **Writing a helper with a DB/HTTP dependency and putting it in `src/lib/`** — `lib` is pure code
@@ -893,7 +1135,15 @@ globals, jobs/tasks, and workflows with their full TypeScript types. Do not dupl
 <!-- If everything follows the skill, this section can be omitted. -->
 - <e.g. "All webhook events are stored before processing — never process without persisting first">
 - <e.g. "The `runners/` directory is legacy; new tasks go in `jobs/tasks/`">
+- <e.g. "Payload access is dependency-injected: stores/services take a `Payload` in the constructor,
+  controllers build them per request from `req.payload`, and only `src/lib/payload-client.ts` imports
+  `@payload-config` (dynamically). Do not reintroduce `getPayload({ config })` in stores.">
 ```
+
+> **If this project uses the dependency-injection model** (constructor-injected `Payload`, the
+> `payload-client.ts` helper, per-request `deps(req)` in controllers), record it in the
+> project-specific conventions above — otherwise the next contributor will reintroduce the old
+> `getPayload({ config: configPromise })`-per-store-method pattern.
 
 **Rules for writing a good CLAUDE.md:**
 - Do NOT repeat anything already in the `payload-arch` or `payload` skills.
