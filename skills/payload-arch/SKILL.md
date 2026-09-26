@@ -10,7 +10,7 @@ description: >
   dependency flow, SWR + payloadClientSDK on the frontend, constants in src/const, env in
   src/config/config.ts, pure helpers in src/lib, and jobs split into task definitions and workflows.
   The Payload instance is dependency-injected through constructors (stores/services take a Payload;
-  controllers build them per request from req.payload); only a memoized payload-client helper imports
+  controllers build them per request from req.payload); only a memoized payload-instance helper imports
   @payload-config, via a dynamic import, to keep the config off the startup module graph.
   Also use it for custom PayloadCMS admin panel components (custom field inputs, UI fields, cells,
   row labels) that use Payload UI hooks like useField, useForm, useDocumentInfo, and useFormInitializing.
@@ -64,11 +64,11 @@ bootstrap call from every store method.
 The helper — the **only** module allowed to name `@payload-config` outside `src/app/**`:
 
 ```ts
-// src/lib/payload-client.ts
+// src/lib/payload-instance.ts
 import { getPayload, type Payload, type SanitizedConfig } from 'payload'
 
 let configLoad: Promise<SanitizedConfig> | undefined
-let clientLoad: Promise<Payload> | undefined
+let instanceLoad: Promise<Payload> | undefined
 
 /** For the rare caller needing the config itself (e.g. email transport settings). */
 export function loadPayloadConfig(): Promise<SanitizedConfig> {
@@ -77,9 +77,9 @@ export function loadPayloadConfig(): Promise<SanitizedConfig> {
 }
 
 /** Drop-in replacement for `getPayload({ config: configPromise })`. */
-export function getPayloadClient(): Promise<Payload> {
-  clientLoad ??= loadPayloadConfig().then((config) => getPayload({ config }))
-  return clientLoad
+export function getPayloadInstance(): Promise<Payload> {
+  instanceLoad ??= loadPayloadConfig().then((config) => getPayload({ config }))
+  return instanceLoad
 }
 ```
 
@@ -90,14 +90,14 @@ export function getPayloadClient(): Promise<Payload> {
 | Controller handler | `req.payload` |
 | Collection hook | `req.payload` (or `args.req.payload` in `afterOperation`) |
 | Job task / workflow handler | `req.payload` (handlers receive `{ input, req }`) |
-| Agent tool / script / cron / test bootstrap | `await getPayloadClient()` |
+| Agent tool / script / cron / test bootstrap | `await getPayloadInstance()` |
 | Unit test with mocked collaborators | `{} as Payload` stub |
 
 Rules:
 - The `import('@payload-config')` **must stay dynamic** — making it static reintroduces the cycle and
   undoes the whole win.
 - Both functions memoize with `??=` on a **module-scoped promise**, not a boolean flag.
-- Call `getPayloadClient()` **only** where no request exists (agent tools, scripts, cron, tests).
+- Call `getPayloadInstance()` **only** where no request exists (agent tools, scripts, cron, tests).
   Anywhere with a request, use `req.payload`.
 - `src/app/**` (pages, route handlers) and per-request Next config — e.g. a `next-intl`
   `getRequestConfig` that calls `payload.auth({ headers })` — keep importing `@payload-config`
@@ -581,7 +581,7 @@ Rules:
 - Functions only — no classes needed.
 - Shared across all layers; any layer may import from `src/lib`.
 - File naming: `<purpose>.ts` or `<domain>.<purpose>.ts`.
-- **One sanctioned exception:** `src/lib/payload-client.ts` (see *Payload access*) is the single
+- **One sanctioned exception:** `src/lib/payload-instance.ts` (see *Payload access*) is the single
   module that loads `@payload-config` and calls `getPayload()`. It lives here because it's the shared
   bootstrap edge, not because it's pure.
 
@@ -654,7 +654,7 @@ Ordered by measured impact:
 - **Keep `@payload-config` off the startup graph** (see *Payload access* above — the config cycle is
   the architectural cause). Verify with `npx madge --circular --extensions ts,tsx src/` and
   `grep -rln "@payload-config\|payload.config" src | grep -v "^src/app/"` — the only non-`src/app/**`
-  hit should be `payload-client.ts`. Report reachable-file and cycle counts before/after so the win is
+  hit should be `payload-instance.ts`. Report reachable-file and cycle counts before/after so the win is
   judged, not assumed.
 - **`serverExternalPackages`** in `next.config.ts` for any native/heavy dep that resolves
   platform-specific binaries via a `require()` switch (`sharp`, `canvas`, `duckdb`, `libsql`,
@@ -1054,7 +1054,7 @@ initialization, not on every dependency change.
 | Business logic | `src/services/<domain>.service.ts` |
 | Third-party API wrapper | `src/services/<vendor>/<vendor>.service.ts` |
 | Database queries (Payload CRUD) | `src/store/<domain>.store.ts` |
-| The one dynamic `@payload-config` loader | `src/lib/payload-client.ts` (memoized, dynamic import) |
+| The one dynamic `@payload-config` loader | `src/lib/payload-instance.ts` (memoized, dynamic import) |
 | Reusable pure helpers | `src/lib/<purpose>.ts` |
 | App constants / magic strings | `src/const/<domain>.const.ts` + re-export in `src/const/index.ts` |
 | Environment variables | `src/config/config.ts` |
@@ -1080,11 +1080,11 @@ initialization, not on every dependency change.
 - **Putting logic in a controller** — if you write an `if` that isn't about the HTTP request shape,
   it belongs in a service.
 - **Calling `getPayload()` / importing `@payload-config` in a store, service, or controller** — the
-  `Payload` instance is injected via the constructor (from `req.payload`, or `getPayloadClient()` at
+  `Payload` instance is injected via the constructor (from `req.payload`, or `getPayloadInstance()` at
   non-request entrypoints). Data access still goes through a store, not `getPayload()` in a service.
-- **Static `import '@payload-config'` anywhere below `src/app/**` except `payload-client.ts`** —
+- **Static `import '@payload-config'` anywhere below `src/app/**` except `payload-instance.ts`** —
   reintroduces the config cycle and drags the whole backend into every module graph. Use
-  `getPayloadClient()` (dynamic import) or `req.payload`.
+  `getPayloadInstance()` (dynamic import) or `req.payload`.
 - **Building a payload-consuming dependency in a class-field initializer** — with `target: ES2022`,
   field initializers run before parameter properties, so `this.payload` is `undefined` (`TS2729`).
   Build it in the constructor body.
@@ -1136,12 +1136,12 @@ globals, jobs/tasks, and workflows with their full TypeScript types. Do not dupl
 - <e.g. "All webhook events are stored before processing — never process without persisting first">
 - <e.g. "The `runners/` directory is legacy; new tasks go in `jobs/tasks/`">
 - <e.g. "Payload access is dependency-injected: stores/services take a `Payload` in the constructor,
-  controllers build them per request from `req.payload`, and only `src/lib/payload-client.ts` imports
+  controllers build them per request from `req.payload`, and only `src/lib/payload-instance.ts` imports
   `@payload-config` (dynamically). Do not reintroduce `getPayload({ config })` in stores.">
 ```
 
 > **If this project uses the dependency-injection model** (constructor-injected `Payload`, the
-> `payload-client.ts` helper, per-request `deps(req)` in controllers), record it in the
+> `payload-instance.ts` helper, per-request `deps(req)` in controllers), record it in the
 > project-specific conventions above — otherwise the next contributor will reintroduce the old
 > `getPayload({ config: configPromise })`-per-store-method pattern.
 
