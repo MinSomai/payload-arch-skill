@@ -390,6 +390,36 @@ Rules:
 - Must never import a service or controller.
 - File naming: `<domain>.store.ts`.
 
+### Relationship values — use `extractID`, never `typeof` checks
+
+A relationship field is typed as `string | Doc` (or `number | Doc`): an ID at `depth: 0`, a populated
+document at `depth >= 1`. Hooks and `afterOperation` args can hand you either shape. Do **not** narrow
+it by hand — Payload ships a helper for exactly this:
+
+```ts
+import { extractID } from 'payload/shared'
+
+// ✅ Works for both shapes; return type is the ID type
+const courseId = extractID(assignment.course)
+await this.payload.find({
+  collection: 'submissions',
+  where: { course: { equals: courseId } },
+  depth: 0,
+})
+
+// ❌ Hand-rolled narrowing — duplicated in every file, drifts when the ID type changes
+const courseId = typeof assignment.course === 'string' ? assignment.course : assignment.course.id
+```
+
+Rules:
+- `extractID` is the only accepted way to get an ID out of a `string | Doc` value. It is a pure helper
+  from `payload/shared`, so it is safe to import in any layer, including `src/lib` and client components.
+- It does **not** give you the populated document. If you need fields off the related doc, request the
+  right `depth` or fetch it explicitly through its store; don't `typeof`-branch to use the object "if
+  it happens to be populated".
+- Arrays (`hasMany`) are just `values.map(extractID)`. Polymorphic relationships
+  (`{ relationTo, value }`) still need `extractID(rel.value)` on the inner `value`.
+
 ### Transactions and enforced access — pass typed values, never raw `req`
 
 Stores keep the constructor-injected `payload` and take everything else as **typed arguments**. Never
@@ -1091,6 +1121,8 @@ initialization, not on every dependency change.
 - **Caching `deps(req)` on the controller instance** — leaks one request's context into a shared
   object; rebuild it per handler.
 - **Importing a service from a store** — inward-only rule violation.
+- **`typeof rel === 'string' ? rel : rel.id` to read a relationship ID** — use `extractID` from
+  `payload/shared`, which handles the ID-or-populated-doc union for you (see *Stores*).
 - **Hardcoding strings that are used in multiple places** — put them in `src/const/`.
 - **Writing a helper with a DB/HTTP dependency and putting it in `src/lib/`** — `lib` is pure code
   only. Put impure helpers in `src/services/lib/` instead.
